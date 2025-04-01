@@ -11,4 +11,7 @@ public enum DisconnectErrorCodes {
      * https://developer.android.com/reference/android/net/ConnectivityManager?hl=en
      */
     couldNotGetConnectivityManager,
+    couldNotDisconnect,
+    timeoutOccurred
+
 }

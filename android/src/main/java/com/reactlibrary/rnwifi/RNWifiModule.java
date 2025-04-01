@@ -391,45 +391,100 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
     /**
      * Disconnect currently connected WiFi network.
      */
+ 
+
+    // New helper methods
+   
     @ReactMethod
     public void disconnect(final Promise promise) {
-        final int timeout = TIMEOUT_REMOVE_MILLIS;
+        final int timeout = 20000;
         final Handler timeoutHandler = new Handler(Looper.getMainLooper());
+
         final Runnable timeoutRunnable = () -> {
-            promise.reject(ConnectErrorCodes.timeoutOccurred.toString(), "Connection timeout");
-            if (isAndroidTenOrLater()) {
-                DisconnectCallbackHolder.getInstance().unbindProcessFromNetwork();
-                DisconnectCallbackHolder.getInstance().disconnect();
-            }
+            boolean nativeDisconnectSuccess = wifi.disconnect();
+            cleanupNetworkResources();
+            promise.reject(DisconnectErrorCodes.timeoutOccurred.toString(), 
+                "Timeout but forced disconnect: " + (nativeDisconnectSuccess ? "success" : "failed"));
         };
 
         timeoutHandler.postDelayed(timeoutRunnable, timeout);
+
+        if (isAndroidTenOrLater()) {
+            removeNetworkSuggestionsForCurrentSSID();
+            disableAutoJoinForCurrentNetwork();
+        }
 
         WifiUtils.withContext(this.context).disconnect(new DisconnectionSuccessListener() {
             @Override
             public void success() {
                 timeoutHandler.removeCallbacks(timeoutRunnable);
-                promise.resolve(true);
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (!getConnectionStatus()) {
+                        cleanupNetworkResources();
+                        promise.resolve(true);
+                    } else {
+                        wifi.disconnect();
+                        promise.resolve(false);
+                    }
+                }, 3000);
             }
 
             @Override
             public void failed(@NonNull DisconnectionErrorCode errorCode) {
                 timeoutHandler.removeCallbacks(timeoutRunnable);
-                switch (errorCode) {
-                    case COULD_NOT_GET_WIFI_MANAGER: {
-                        promise.reject(DisconnectErrorCodes.couldNotGetWifiManager.toString(), "Could not get WifiManager.");
-                    }
-                    case COULD_NOT_GET_CONNECTIVITY_MANAGER: {
-                        promise.reject(DisconnectErrorCodes.couldNotGetConnectivityManager.toString(), "Could not get Connectivity Manager.");
-                    }
-                    default:
-                    case COULD_NOT_DISCONNECT: {
-                        promise.resolve(false);
-                    }
-                }
+                boolean nativeSuccess = wifi.disconnect();
+                cleanupNetworkResources();
+                promise.resolve(nativeSuccess);
             }
         });
     }
+
+// New helper methods
+    @RequiresApi(api = Build.VERSION_CODES.Q)
+    private void removeNetworkSuggestionsForCurrentSSID() {
+        final WifiInfo connectionInfo = wifi.getConnectionInfo();
+        if (connectionInfo == null) return;
+        
+        final String currentSSID = connectionInfo.getSSID().replace("\"", "");
+        final List<WifiNetworkSuggestion> suggestions = wifi.getNetworkSuggestions();
+        if (suggestions == null) return;
+
+        final List<WifiNetworkSuggestion> filtered = new ArrayList<>();
+        for (WifiNetworkSuggestion suggestion : suggestions) {
+            if (!suggestion.getSsid().equals(currentSSID)) {
+                filtered.add(suggestion);
+            }
+        }
+        
+        wifi.removeNetworkSuggestions(suggestions);
+        wifi.addNetworkSuggestions(filtered);
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.Q)
+    private void disableAutoJoinForCurrentNetwork() {
+        final WifiInfo connectionInfo = wifi.getConnectionInfo();
+        if (connectionInfo == null) return;
+
+        final String currentSSID = connectionInfo.getSSID().replace("\"", "");
+        final List<WifiNetworkSuggestion> newSuggestions = new ArrayList<>();
+        
+        final WifiNetworkSuggestion suggestion = new WifiNetworkSuggestion.Builder()
+            .setSsid(currentSSID)
+            .setIsAppInteractionRequired(true)
+            .build();
+        
+        newSuggestions.add(suggestion);
+        wifi.addNetworkSuggestions(newSuggestions);
+    }
+
+private void cleanupNetworkResources() {
+    if (isAndroidTenOrLater()) {
+        ConnectivityManager connectivityManager = 
+            (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        connectivityManager.bindProcessToNetwork(null);
+        joinedNetwork = null;
+    }
+}
 
     /**
      * This method will return current SSID
@@ -623,75 +678,55 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
 
     @RequiresApi(api = Build.VERSION_CODES.Q)
     private void connectAndroidQ(@NonNull final String SSID, @NonNull final String password, final boolean isHidden, final int timeout, final Promise promise) {
-        WifiNetworkSpecifier.Builder wifiNetworkSpecifier = new WifiNetworkSpecifier.Builder()
-                .setIsHiddenSsid(isHidden)
-                .setSsid(SSID);
+        final WifiNetworkSuggestion suggestion = new WifiNetworkSuggestion.Builder()
+            .setSsid(SSID)
+            .setWpa2Passphrase(password)
+            .setIsHiddenSsid(isHidden)
+            .build();
 
-        if (!isNullOrEmpty(password)) {
-            wifiNetworkSpecifier.setWpa2Passphrase(password);
+        final List<WifiNetworkSuggestion> suggestions = new ArrayList<>();
+        suggestions.add(suggestion);
+
+        final WifiManager wifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+        final int status = wifiManager.addNetworkSuggestions(suggestions);
+
+        if (status != WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS) {
+            promise.reject(ConnectErrorCodes.didNotFindNetwork.toString(), "Failed to add network suggestion");
+            return;
         }
 
-        NetworkRequest nr = new NetworkRequest.Builder()
-                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
-                //.addCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED)
-                .setNetworkSpecifier(wifiNetworkSpecifier.build())
-                .build();
-
-        // cleanup previous connections just in case
-        DisconnectCallbackHolder.getInstance().disconnect();
-
-        joinedNetwork = null;
-
-        ConnectivityManager connectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
-
-        final Handler timeoutHandler = new Handler(Looper.getMainLooper());
-        final Runnable timeoutRunnable = () -> {
-            promise.reject(ConnectErrorCodes.timeoutOccurred.toString(), "Connection timeout");
-            DisconnectCallbackHolder.getInstance().unbindProcessFromNetwork();
-            DisconnectCallbackHolder.getInstance().disconnect();
-        };
-
-        timeoutHandler.postDelayed(timeoutRunnable, timeout);
-
-        ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+        // Register a receiver to detect connection success
+        final BroadcastReceiver connectionReceiver = new BroadcastReceiver() {
             @Override
-            public void onAvailable(@NonNull Network network) {
-                super.onAvailable(network);
-                timeoutHandler.removeCallbacks(timeoutRunnable);
-                joinedNetwork = network;
-                DisconnectCallbackHolder.getInstance().bindProcessToNetwork(network);
-                //connectivityManager.setNetworkPreference(ConnectivityManager.DEFAULT_NETWORK_PREFERENCE);
-                if (!pollForValidSSID(3, SSID)) {
-                    promise.reject(ConnectErrorCodes.android10ImmediatelyDroppedConnection.toString(), "Firmware bugs on OnePlus prevent it from connecting on some firmware versions.");
-                    return;
+            public void onReceive(Context context, Intent intent) {
+                if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
+                    NetworkInfo networkInfo = intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO);
+                    if (networkInfo != null && networkInfo.isConnected()) {
+                        WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+                        String connectedSSID = wifiInfo.getSSID().replace("\"", "");
+                        if (connectedSSID.equals(SSID)) {
+                            // Unregister receiver to avoid multiple calls
+                            context.unregisterReceiver(this);
+                            promise.resolve("connected");
+                        }
+                    }
                 }
-                promise.resolve("connected");
-            }
-
-            @Override
-            public void onUnavailable() {
-                super.onUnavailable();
-                timeoutHandler.removeCallbacks(timeoutRunnable);
-                joinedNetwork = null;
-                promise.reject(ConnectErrorCodes.didNotFindNetwork.toString(), "Network not found or network request cannot be fulfilled.");
-            }
-
-            @Override
-            public void onLost(@NonNull Network network) {
-                super.onLost(network);
-                timeoutHandler.removeCallbacks(timeoutRunnable);
-                joinedNetwork = null;
-                DisconnectCallbackHolder.getInstance().unbindProcessFromNetwork();
-                DisconnectCallbackHolder.getInstance().disconnect();
             }
         };
 
-        DisconnectCallbackHolder.getInstance().addNetworkCallback(networkCallback, connectivityManager);
-        DisconnectCallbackHolder.getInstance().requestNetwork(nr);
-    }
+        // Timeout handler
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.postDelayed(() -> {
+            context.unregisterReceiver(connectionReceiver);
+            promise.reject(ConnectErrorCodes.timeoutOccurred.toString(), "Connection timeout");
+        }, timeout);
 
+        // Register the receiver
+        context.registerReceiver(connectionReceiver, new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
+
+        // Optional: Trigger a reconnect to ensure the suggestion is used
+        wifiManager.reconnect();
+    }
     private static String longToIP(int longIp) {
         StringBuilder sb = new StringBuilder();
         String[] strip = new String[4];
