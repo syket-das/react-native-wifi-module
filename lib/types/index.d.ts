@@ -1,4 +1,4 @@
-declare module 'react-native-wifi-reborn' {
+declare module '@syket/react-native-wifi-module' {
     export type WiFiObject = {
         SSID: string;
         BSSID: string;

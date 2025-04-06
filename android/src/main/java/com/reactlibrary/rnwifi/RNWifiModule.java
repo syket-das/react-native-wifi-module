@@ -70,6 +70,9 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
 
     private static final int TIMEOUT_MILLIS = 15000;
     private static final int TIMEOUT_REMOVE_MILLIS = 10000;
+    private BroadcastReceiver connectionReceiver;
+    private Handler connectionTimeoutHandler;
+    private Handler timeoutHandler;
 
     RNWifiModule(ReactApplicationContext context) {
         super(context);
@@ -83,6 +86,12 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
     @NonNull
     public String getName() {
         return "WifiManager";
+    }
+
+    @Override
+    public void invalidate() {
+        // Cleanup resources here
+        super.invalidate();
     }
 
     /**
@@ -397,44 +406,69 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
    
     @ReactMethod
     public void disconnect(final Promise promise) {
-        final int timeout = 20000;
-        final Handler timeoutHandler = new Handler(Looper.getMainLooper());
-
-        final Runnable timeoutRunnable = () -> {
-            boolean nativeDisconnectSuccess = wifi.disconnect();
-            cleanupNetworkResources();
-            promise.reject(DisconnectErrorCodes.timeoutOccurred.toString(), 
-                "Timeout but forced disconnect: " + (nativeDisconnectSuccess ? "success" : "failed"));
-        };
-
-        timeoutHandler.postDelayed(timeoutRunnable, timeout);
+        // Store timeoutHandler reference at class level to prevent multiple running timers
+        if (timeoutHandler != null) {
+            timeoutHandler.removeCallbacksAndMessages(null);
+        }
+        
+        timeoutHandler = new Handler(Looper.getMainLooper());
+        timeoutHandler.postDelayed(() -> {
+            try {
+                boolean nativeDisconnectSuccess = wifi.disconnect();
+                cleanupNetworkResources();
+                promise.resolve(nativeDisconnectSuccess);
+            } catch (Exception e) {
+                promise.reject(DisconnectErrorCodes.exception.toString(), e.getMessage());
+            }
+        }, 20000);
 
         if (isAndroidTenOrLater()) {
-            removeNetworkSuggestionsForCurrentSSID();
-            disableAutoJoinForCurrentNetwork();
+            try {
+                removeNetworkSuggestionsForCurrentSSID();
+                disableAutoJoinForCurrentNetwork();
+            } catch (Exception e) {
+                Log.e(TAG, "Error during Android 10+ disconnect preparation", e);
+            }
         }
 
         WifiUtils.withContext(this.context).disconnect(new DisconnectionSuccessListener() {
             @Override
             public void success() {
-                timeoutHandler.removeCallbacks(timeoutRunnable);
+                if (timeoutHandler != null) {
+                    timeoutHandler.removeCallbacksAndMessages(null);
+                    timeoutHandler = null;
+                }
+                
                 new Handler(Looper.getMainLooper()).postDelayed(() -> {
                     if (!getConnectionStatus()) {
                         cleanupNetworkResources();
                         promise.resolve(true);
                     } else {
-                        wifi.disconnect();
-                        promise.resolve(false);
+                        try {
+                            wifi.disconnect();
+                            cleanupNetworkResources();
+                            promise.resolve(true);
+                        } catch (Exception e) {
+                            promise.reject(DisconnectErrorCodes.exception.toString(), e.getMessage());
+                        }
                     }
                 }, 3000);
             }
 
             @Override
             public void failed(@NonNull DisconnectionErrorCode errorCode) {
-                timeoutHandler.removeCallbacks(timeoutRunnable);
-                boolean nativeSuccess = wifi.disconnect();
-                cleanupNetworkResources();
-                promise.resolve(nativeSuccess);
+                if (timeoutHandler != null) {
+                    timeoutHandler.removeCallbacksAndMessages(null);
+                    timeoutHandler = null;
+                }
+                
+                try {
+                    boolean nativeSuccess = wifi.disconnect();
+                    cleanupNetworkResources();
+                    promise.resolve(nativeSuccess);
+                } catch (Exception e) {
+                    promise.reject(DisconnectErrorCodes.exception.toString(), e.getMessage());
+                }
             }
         });
     }
@@ -446,8 +480,7 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
         if (connectionInfo == null) return;
         
         final String currentSSID = connectionInfo.getSSID().replace("\"", "");
-        final List<WifiNetworkSuggestion> suggestions = wifi.getNetworkSuggestions();
-        if (suggestions == null) return;
+        final List<WifiNetworkSuggestion> suggestions = wifi.getNetworkSuggestions();       if (suggestions == null) return;
 
         final List<WifiNetworkSuggestion> filtered = new ArrayList<>();
         for (WifiNetworkSuggestion suggestion : suggestions) {
@@ -477,14 +510,42 @@ public class RNWifiModule extends ReactContextBaseJavaModule {
         wifi.addNetworkSuggestions(newSuggestions);
     }
 
-private void cleanupNetworkResources() {
-    if (isAndroidTenOrLater()) {
-        ConnectivityManager connectivityManager = 
-            (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
-        connectivityManager.bindProcessToNetwork(null);
-        joinedNetwork = null;
+    private void cleanupNetworkResources() {
+        try {
+            // Clean up timers
+            if (timeoutHandler != null) {
+                timeoutHandler.removeCallbacksAndMessages(null);
+                timeoutHandler = null;
+            }
+            
+            if (connectionTimeoutHandler != null) {
+                connectionTimeoutHandler.removeCallbacksAndMessages(null);
+                connectionTimeoutHandler = null;
+            }
+            
+            // Clean up receivers
+            if (connectionReceiver != null) {
+                try {
+                    context.unregisterReceiver(connectionReceiver);
+                } catch (IllegalArgumentException e) {
+                    // Receiver was not registered, ignore
+                }
+                connectionReceiver = null;
+            }
+            
+            // Reset network binding
+            if (isAndroidTenOrLater()) {
+                ConnectivityManager connectivityManager = 
+                    (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (connectivityManager != null) {
+                    connectivityManager.bindProcessToNetwork(null);
+                }
+                joinedNetwork = null;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error during resource cleanup", e);
+        }
     }
-}
 
     /**
      * This method will return current SSID
@@ -678,54 +739,109 @@ private void cleanupNetworkResources() {
 
     @RequiresApi(api = Build.VERSION_CODES.Q)
     private void connectAndroidQ(@NonNull final String SSID, @NonNull final String password, final boolean isHidden, final int timeout, final Promise promise) {
-        final WifiNetworkSuggestion suggestion = new WifiNetworkSuggestion.Builder()
-            .setSsid(SSID)
-            .setWpa2Passphrase(password)
-            .setIsHiddenSsid(isHidden)
-            .build();
-
-        final List<WifiNetworkSuggestion> suggestions = new ArrayList<>();
-        suggestions.add(suggestion);
-
-        final WifiManager wifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
-        final int status = wifiManager.addNetworkSuggestions(suggestions);
-
-        if (status != WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS) {
-            promise.reject(ConnectErrorCodes.didNotFindNetwork.toString(), "Failed to add network suggestion");
-            return;
+        // Store the receiver as class member to ensure it can be unregistered later
+        if (connectionReceiver != null) {
+            try {
+                context.unregisterReceiver(connectionReceiver);
+            } catch (Exception e) {
+                Log.e(TAG, "Error unregistering previous connectionReceiver", e);
+            }
+            connectionReceiver = null;
         }
+        
+        try {
+            final WifiNetworkSuggestion suggestion = new WifiNetworkSuggestion.Builder()
+                .setSsid(SSID)
+                .setWpa2Passphrase(password)
+                .setIsHiddenSsid(isHidden)
+                .build();
 
-        // Register a receiver to detect connection success
-        final BroadcastReceiver connectionReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
-                    NetworkInfo networkInfo = intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO);
-                    if (networkInfo != null && networkInfo.isConnected()) {
-                        WifiInfo wifiInfo = wifiManager.getConnectionInfo();
-                        String connectedSSID = wifiInfo.getSSID().replace("\"", "");
-                        if (connectedSSID.equals(SSID)) {
-                            // Unregister receiver to avoid multiple calls
-                            context.unregisterReceiver(this);
-                            promise.resolve("connected");
+            final List<WifiNetworkSuggestion> suggestions = new ArrayList<>();
+            suggestions.add(suggestion);
+
+            // Remove any existing suggestions for this SSID first
+            List<WifiNetworkSuggestion> existingSuggestions = wifi.getNetworkSuggestions();
+            if (existingSuggestions != null && !existingSuggestions.isEmpty()) {
+                wifi.removeNetworkSuggestions(existingSuggestions);
+            }
+
+            final int status = wifi.addNetworkSuggestions(suggestions);
+
+            if (status != WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS) {
+                promise.reject(ConnectErrorCodes.didNotFindNetwork.toString(), "Failed to add network suggestion, code: " + status);
+                return;
+            }
+
+            // Register a receiver with proper error handling
+            connectionReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(intent.getAction())) {
+                        NetworkInfo networkInfo = intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO);
+                        if (networkInfo != null && networkInfo.isConnected()) {
+                            WifiInfo wifiInfo = wifi.getConnectionInfo();
+                            if (wifiInfo != null) {
+                                String connectedSSID = wifiInfo.getSSID().replace("\"", "");
+                                if (connectedSSID.equals(SSID)) {
+                                    // Successfully connected
+                                    try {
+                                        context.unregisterReceiver(this);
+                                        connectionReceiver = null;
+                                        if (connectionTimeoutHandler != null) {
+                                            connectionTimeoutHandler.removeCallbacksAndMessages(null);
+                                            connectionTimeoutHandler = null;
+                                        }
+                                        promise.resolve("connected");
+                                    } catch (Exception e) {
+                                        Log.e(TAG, "Error in connection success handler", e);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            };
+
+            // Create a timeout handler with cleanup
+            if (connectionTimeoutHandler != null) {
+                connectionTimeoutHandler.removeCallbacksAndMessages(null);
             }
-        };
+            
+            connectionTimeoutHandler = new Handler(Looper.getMainLooper());
+            connectionTimeoutHandler.postDelayed(() -> {
+                try {
+                    if (connectionReceiver != null) {
+                        context.unregisterReceiver(connectionReceiver);
+                        connectionReceiver = null;
+                    }
+                    promise.reject(ConnectErrorCodes.timeoutOccurred.toString(), "Connection timeout");
+                } catch (Exception e) {
+                    Log.e(TAG, "Error in timeout handler", e);
+                    promise.reject(
+    ConnectErrorCodes.unableToConnect.toString(), 
+    "Connection failed: " + e.getMessage()
+);
+                }
+            }, timeout);
 
-        // Timeout handler
-        final Handler handler = new Handler(Looper.getMainLooper());
-        handler.postDelayed(() -> {
-            context.unregisterReceiver(connectionReceiver);
-            promise.reject(ConnectErrorCodes.timeoutOccurred.toString(), "Connection timeout");
-        }, timeout);
-
-        // Register the receiver
-        context.registerReceiver(connectionReceiver, new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
-
-        // Optional: Trigger a reconnect to ensure the suggestion is used
-        wifiManager.reconnect();
+            // Register the receiver with proper try/catch
+            try {
+                context.registerReceiver(connectionReceiver, new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
+                wifi.reconnect();
+            } catch (Exception e) {
+                Log.e(TAG, "Error registering connection receiver", e);
+                promise.reject(
+    ConnectErrorCodes.unableToConnect.toString(), 
+    "Connection failed: " + e.getMessage()
+);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Exception in connectAndroidQ", e);
+            promise.reject(
+    ConnectErrorCodes.unableToConnect.toString(), 
+    "Connection failed: " + e.getMessage()
+);
+        }
     }
     private static String longToIP(int longIp) {
         StringBuilder sb = new StringBuilder();

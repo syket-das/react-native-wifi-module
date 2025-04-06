@@ -44,4 +44,5 @@ public enum ConnectErrorCodes {
      */
     android10ImmediatelyDroppedConnection,
     unableToConnect,
+    exception
 }

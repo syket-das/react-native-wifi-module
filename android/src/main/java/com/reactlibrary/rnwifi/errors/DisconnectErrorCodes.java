@@ -12,6 +12,7 @@ public enum DisconnectErrorCodes {
      */
     couldNotGetConnectivityManager,
     couldNotDisconnect,
-    timeoutOccurred
+    timeoutOccurred,
+    exception
 
 }
